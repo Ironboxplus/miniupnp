@@ -1,0 +1,83 @@
+# Fix for the nftables netlink desync (see openwrt-op/test/nft_resync_test.sh):
+# reproduce the bug with stock 2.3.9, prove the fix, then build the OpenWrt
+# package for op (ImmortalWrt 24.10, mediatek/filogic, aarch64_cortex-a53).
+name: op-build
+
+on:
+  push:
+    branches: [op/2.3.9-nft-resync]
+  workflow_dispatch:
+
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build dependencies
+        run: sudo apt-get update -q && sudo apt-get install -y -q libmnl-dev libnftnl-dev libcap-ng-dev uuid-dev libssl-dev pkg-config nftables
+      - name: Build stock 2.3.9 and the fix
+        run: |
+          git worktree add ../stock miniupnpd_2_3_9
+          for d in ../stock "$PWD"; do
+            (cd "$d/miniupnpd" && ./configure --firewall=nftables > /dev/null && make -j"$(nproc)" > /dev/null)
+          done
+          ls -l ../stock/miniupnpd/miniupnpd miniupnpd/miniupnpd
+      - name: Stock 2.3.9 must reproduce the desync
+        run: |
+          set +e
+          sudo bash openwrt-op/test/nft_resync_test.sh ../stock/miniupnpd/miniupnpd
+          rc=$?
+          echo "stock exit code: $rc"
+          [ "$rc" -eq 1 ] || { echo "::error::stock 2.3.9 did not fail, the test does not reproduce the bug"; exit 1; }
+      - name: The fix must pass
+        run: sudo bash openwrt-op/test/nft_resync_test.sh miniupnpd/miniupnpd
+
+  ipk:
+    needs: regression
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the ImmortalWrt 24.10 SDK
+        run: |
+          base=https://downloads.immortalwrt.org/releases/24.10-SNAPSHOT/targets/mediatek/filogic
+          sdk=$(curl -fsSL "$base/" | grep -o 'immortalwrt-sdk-[^"<>]*\.tar\.zst' | head -1)
+          echo "SDK: $sdk"
+          curl -fsSL "$base/$sdk" -o sdk.tar.zst
+          mkdir sdk && tar --zstd -xf sdk.tar.zst -C sdk --strip-components=1
+          curl -fsSL "$base/sha256sums" | grep " \*$sdk\$" | awk '{print $1"  sdk.tar.zst"}' | sha256sum -c
+      - name: Feeds, with our miniupnpd package
+        working-directory: sdk
+        run: |
+          ./scripts/feeds update base packages > /dev/null
+          rm -rf feeds/packages/net/miniupnpd
+          cp -r ../openwrt-op/package/miniupnpd feeds/packages/net/miniupnpd
+          ./scripts/feeds update -i packages > /dev/null
+          ./scripts/feeds install miniupnpd > /dev/null
+          make defconfig > /dev/null
+          sed -i '/CONFIG_PACKAGE_miniupnpd-iptables/d' .config
+          echo '# CONFIG_PACKAGE_miniupnpd-iptables is not set' >> .config
+          echo 'CONFIG_PACKAGE_miniupnpd-nftables=m' >> .config
+          make defconfig > /dev/null
+      - name: Compile
+        working-directory: sdk
+        run: make package/miniupnpd/compile -j"$(nproc)" || make package/miniupnpd/compile -j1 V=s
+      - name: Check the package
+        working-directory: sdk
+        run: |
+          ipk=$(find bin/packages -name 'miniupnpd-nftables_2.3.9-r2_aarch64_cortex-a53.ipk')
+          [ -n "$ipk" ] || { echo "::error::no ipk"; find bin -name '*.ipk'; exit 1; }
+          mkdir chk && (cd chk && tar -xzf "../$ipk" && tar -xzf control.tar.gz && tar -xzf data.tar.gz)
+          cat chk/control
+          grep -q '^Depends: libc, libcap-ng, libmnl0, libuuid1, libnftnl11$' chk/control
+          strings chk/usr/sbin/miniupnpd | grep -q 'reopening the netlink socket'
+          sha256sum "$ipk" | tee ../SHA256SUMS
+          cp "$ipk" ..
+      - uses: actions/upload-artifact@v4
+        with:
+          name: miniupnpd-nftables-2.3.9-r2-op
+          path: |
+            miniupnpd-nftables_*.ipk
+            SHA256SUMS
+          retention-days: 2

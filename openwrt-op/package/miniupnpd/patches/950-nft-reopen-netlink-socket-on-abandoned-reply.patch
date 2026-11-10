@@ -1,0 +1,160 @@
+diff --git a/netfilter_nft/nftnlrdr_misc.c b/netfilter_nft/nftnlrdr_misc.c
+index c8b8f16..8acaf46 100644
+--- a/netfilter_nft/nftnlrdr_misc.c
++++ b/netfilter_nft/nftnlrdr_misc.c
+@@ -117,6 +117,33 @@ nft_mnl_disconnect(void)
+ 	}
+ }
+ 
++/*
++ * Replace the netlink socket with a fresh one.
++ *
++ * The socket is long-lived. When a dump or a batch reply is abandoned
++ * before NLMSG_DONE / the final ACK (mnl_cb_run() error, recv error,
++ * interrupted dump...), the rest of that reply stays queued on it. Every
++ * later request then reads those stale messages first, fails the sequence
++ * check and returns early again, leaving even more behind: the daemon can
++ * no longer list, add or delete rules until it is restarted, and expired
++ * mappings pile up in the ruleset. A new socket starts with an empty
++ * receive queue. The rule caches may be out of date as well, so drop them.
++ */
++static void
++nft_mnl_resync(const char *caller)
++{
++	syslog(LOG_WARNING, "%s: netlink reply not fully read, reopening the netlink socket",
++	       caller);
++	nft_mnl_disconnect();
++	if (nft_mnl_connect() < 0) {
++		nft_mnl_disconnect();
++		syslog(LOG_ERR, "%s: could not reopen the netlink socket", caller);
++	}
++	rule_list_filter_validate = RULE_CACHE_INVALID;
++	rule_list_redirect_validate = RULE_CACHE_INVALID;
++	rule_list_peer_validate = RULE_CACHE_INVALID;
++}
++
+ #ifdef DEBUG
+ void
+ print_rule(const char *func, int line, const struct nftnl_rule *rule)
+@@ -691,11 +718,47 @@ flush_nft_cache(struct rule_list *head)
+ 	LIST_INIT(head);
+ }
+ 
++/* A dump is interrupted (NLM_F_DUMP_INTR, errno EINTR) whenever the ruleset
++ * changes while it is being read, which gets likely once the chain no longer
++ * fits in one datagram. That is transient: dump again. */
++#define NFT_DUMP_ATTEMPTS 3
++
++static int
++refresh_nft_cache_once(struct rule_list *head, const char *table, const char *chain, uint32_t family, enum rule_type type);
++
+ /*
+  * return -1 in case of error, 0 if OK
+  */
+ int
+ refresh_nft_cache(struct rule_list *head, const char *table, const char *chain, uint32_t family, enum rule_type type)
++{
++	int attempt;
++	int ret = -1;
++
++	for (attempt = 1; attempt <= NFT_DUMP_ATTEMPTS; attempt++) {
++		errno = 0;
++		ret = refresh_nft_cache_once(head, table, chain, family, type);
++		if (ret == 0)
++			return 0;
++		if (ret == -2) {
++			/* the reply was abandoned half-read */
++			int intr = (errno == EINTR);
++			nft_mnl_resync("refresh_nft_cache");
++			flush_nft_cache(head);
++			if (intr)
++				continue;
++		}
++		break;
++	}
++	return -1;
++}
++
++/*
++ * return 0 if OK, -1 in case of error with the socket still in sync,
++ * -2 if the reply was not read to the end (errno is preserved)
++ */
++static int
++refresh_nft_cache_once(struct rule_list *head, const char *table, const char *chain, uint32_t family, enum rule_type type)
+ {
+ 	char buf[MNL_SOCKET_BUFFER_SIZE];
+ 	struct nlmsghdr *nlh;
+@@ -705,8 +768,12 @@ refresh_nft_cache(struct rule_list *head, const char *table, const char *chain,
+ 	ssize_t n;
+ 
+ 	if (mnl_sock == NULL) {
+-		log_error("netlink not connected");
+-		return -1;
++		/* a previous resync could not reopen it */
++		if (nft_mnl_connect() < 0) {
++			nft_mnl_disconnect();
++			log_error("netlink not connected");
++			return -1;
++		}
+ 	}
+ 	flush_nft_cache(head);
+ 
+@@ -735,17 +802,22 @@ refresh_nft_cache(struct rule_list *head, const char *table, const char *chain,
+ 	do {
+ 		n = mnl_socket_recvfrom(mnl_sock, buf, sizeof(buf));
+ 		if (n < 0) {
++			int saved = errno;
+ 			syslog(LOG_ERR, "%s: mnl_socket_recvfrom: %m",
+ 			       "refresh_nft_cache");
+-			return -1;
++			errno = saved;
++			return -2;
+ 		} else if (n == 0) {
+ 			break;
+ 		}
++		errno = 0;
+ 		ret = mnl_cb_run(buf, n, mnl_seq, mnl_portid, table_cb, &data);
+ 		if (ret <= -1 /*== MNL_CB_ERROR*/) {
+-			syslog(LOG_ERR, "%s: mnl_cb_run returned %d",
++			int saved = errno;
++			syslog(LOG_ERR, "%s: mnl_cb_run returned %d: %m",
+ 			       "refresh_nft_cache", ret);
+-			return -1;
++			errno = saved;
++			return -2;
+ 		}
+ 	} while(ret >= 1 /*== MNL_CB_OK*/);
+ 	/* ret == MNL_CB_STOP */
+@@ -1379,6 +1451,10 @@ start_batch(char *buf, size_t buf_size)
+ 	struct mnl_nlmsg_batch *result;
+ 	mnl_seq = time(NULL);
+ 
++	if (mnl_sock == NULL && nft_mnl_connect() < 0) {
++		/* a previous resync could not reopen it */
++		nft_mnl_disconnect();
++	}
+ 	if (mnl_sock == NULL) {
+ 		log_error("netlink not connected");
+ 		result = NULL;
+@@ -1431,14 +1507,20 @@ send_batch(struct mnl_nlmsg_batch *batch)
+ 		n = mnl_socket_recvfrom(mnl_sock, buf, sizeof(buf));
+ 		if (n == -1) {
+ 			log_error("mnl_socket_recvfrom() FAILED: %m");
++			/* the ACKs of this batch may still be queued */
++			nft_mnl_resync("send_batch");
+ 			return -3;
+ 		} else if (n == 0) {
+ 			break;
+ 		}
++		errno = 0;
+ 		ret = mnl_cb_run(buf, n, 0, mnl_portid, NULL, NULL);
+ 		if (ret <= -1 /*== MNL_CB_ERROR*/) {
+-			syslog(LOG_ERR, "%s: mnl_cb_run returned %d",
++			syslog(LOG_ERR, "%s: mnl_cb_run returned %d: %m",
+ 			       "send_batch", ret);
++			/* the loop stops at the first error message: whatever the
++			 * kernel sent after it is still queued */
++			nft_mnl_resync("send_batch");
+ 			return -4;
+ 		}
+ 	} while (ret >= 1 /*== MNL_CB_OK*/);
