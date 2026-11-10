@@ -1,6 +1,7 @@
 # Fix for the nftables netlink desync (see openwrt-op/test/nft_resync_test.sh):
 # reproduce the bug with stock 2.3.9, prove the fix, then build the OpenWrt
-# package for op (ImmortalWrt 24.10, mediatek/filogic, aarch64_cortex-a53).
+# package for op (ImmortalWrt 24.10, mediatek/filogic) and arthur (ImmortalWrt
+# 25.12, qualcommax/ipq60xx), both aarch64_cortex-a53.
 name: op-build
 
 on:
@@ -34,14 +35,23 @@ jobs:
       - name: The fix must pass
         run: sudo bash openwrt-op/test/nft_resync_test.sh miniupnpd/miniupnpd
 
-  ipk:
+  # op: ImmortalWrt 24.10, opkg (.ipk); arthur: ImmortalWrt 25.12, apk (.apk)
+  package:
     needs: regression
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: op
+            target: 24.10-SNAPSHOT/targets/mediatek/filogic
+          - host: arthur
+            target: 25.12-SNAPSHOT/targets/qualcommax/ipq60xx
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch the ImmortalWrt 24.10 SDK
+      - name: Fetch the ImmortalWrt SDK
         run: |
-          base=https://downloads.immortalwrt.org/releases/24.10-SNAPSHOT/targets/mediatek/filogic
+          base=https://downloads.immortalwrt.org/releases/${{ matrix.target }}
           sdk=$(curl -fsSL "$base/" | grep -o 'immortalwrt-sdk-[^"<>]*\.tar\.zst' | head -1)
           echo "SDK: $sdk"
           curl -fsSL "$base/$sdk" -o sdk.tar.zst
@@ -66,18 +76,29 @@ jobs:
       - name: Check the package
         working-directory: sdk
         run: |
-          ipk=$(find bin/packages -name 'miniupnpd-nftables_2.3.9-r2_aarch64_cortex-a53.ipk')
-          [ -n "$ipk" ] || { echo "::error::no ipk"; find bin -name '*.ipk'; exit 1; }
-          mkdir chk && (cd chk && tar -xzf "../$ipk" && tar -xzf control.tar.gz && tar -xzf data.tar.gz)
-          cat chk/control
-          grep -q '^Depends: libc, libcap-ng, libmnl0, libuuid1, libnftnl11$' chk/control
+          pkg=$(find bin/packages \( -name 'miniupnpd-nftables_2.3.9-r3_*.ipk' -o -name 'miniupnpd-nftables-2.3.9-r3.apk' \))
+          [ -n "$pkg" ] || { echo "::error::no package"; find bin -name 'miniupnpd*'; exit 1; }
+          mkdir chk
+          case "$pkg" in
+          *.ipk)
+            (cd chk && tar -xzf "../$pkg" && tar -xzf control.tar.gz && tar -xzf data.tar.gz)
+            cat chk/control
+            deps=$(sed -n 's/^Depends: //p' chk/control | tr -d ' ' | tr , '\n' | sort | xargs) ;;
+          *.apk)
+            apk=staging_dir/host/bin/apk
+            $apk adbdump "$pkg" | sed -n '1,/^paths:/p' | tee chk/info
+            $apk extract --allow-untrusted --destination chk "$pkg"
+            deps=$(sed -n '/^  depends:/,/^  [a-z]/s/^    - //p' chk/info | sort | xargs) ;;
+          esac
+          echo "depends: $deps"
+          [ "$deps" = "libc libcap-ng libmnl0 libnftnl11 libuuid1" ]
           strings chk/usr/sbin/miniupnpd | grep -q 'reopening the netlink socket'
-          sha256sum "$ipk" | tee ../SHA256SUMS
-          cp "$ipk" ..
+          sha256sum "$pkg" | tee ../SHA256SUMS
+          cp "$pkg" ..
       - uses: actions/upload-artifact@v4
         with:
-          name: miniupnpd-nftables-2.3.9-r2-op
+          name: miniupnpd-nftables-2.3.9-r3-${{ matrix.host }}
           path: |
-            miniupnpd-nftables_*.ipk
+            miniupnpd-nftables*.*pk
             SHA256SUMS
           retention-days: 2
